@@ -1,2 +1,11 @@
 .env
+<<<<<<< Updated upstream
+=======
+.vscode/launch.json
+.vscode/settings.json
+.vscode/settings.json
+*.json
+*.jpg
+*.json
+>>>>>>> Stashed changes
 .vscode/settings.json
