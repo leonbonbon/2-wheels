@@ -1,8 +1,16 @@
 #Gemini for Pi
+import os
+from dotenv import load_dotenv
 from google import genai
-from google.genai import types
-
-client = genai.Client(api_key='GEMINI_API_KEY')
+print("Current Working Directory:", os.getcwd())
+load_dotenv()
+api_key = os.getenv("GEMINI_API_KEY")
+client = genai.Client(api_key=api_key)
+response = client.models.generate_content(
+    model="gemini-2.5-flash",
+    contents="tell me a story?"
+)
+print(response.text)
 
 # try:
 #     client.models.generate_content(
