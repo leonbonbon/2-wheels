@@ -1,0 +1,15 @@
+# secrets
+.env
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# model weights (auto-downloaded by ultralytics on first run)
+*.pt
+
+# OS
+.DS_Store
+Thumbs.db

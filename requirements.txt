@@ -1,0 +1,10 @@
+pyaudio
+SpeechRecognition
+pyserial
+opencv-python-headless
+ultralytics
+google-genai
+edge-tts
+pygame
+pillow
+python-dotenv

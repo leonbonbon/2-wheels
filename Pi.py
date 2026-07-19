@@ -83,6 +83,7 @@ CAM_SEND_EVERY  = 1
 # SHARED STATE
 # ══════════════════════════════════════════════════════════════════════
 state_lock = asyncio.Lock()
+cam_lock   = asyncio.Lock()   # serializes cap.grab()/cap.read() between cv_follow_loop and conversation_loop
 
 robot_state = {
     # --- Gemini / conversation layer ---
@@ -125,7 +126,11 @@ except Exception as e:
 
 # Gemini client
 load_dotenv()
-client = genai.Client(api_key=os.getenv("GEMINI_API_KEY")).aio
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+if not GEMINI_API_KEY:
+    print("❌  GEMINI_API_KEY not set. Create a .env file (see .env.example) with GEMINI_API_KEY=your_key")
+    sys.exit(1)
+client = genai.Client(api_key=GEMINI_API_KEY).aio
 
 SYSTEM_PROMPT = """
 CRITICAL RULES:
@@ -211,7 +216,8 @@ async def cv_follow_loop():
             await asyncio.sleep(interval)
             continue
 
-        ret, frame = await asyncio.to_thread(grab_fresh_frame)
+        async with cam_lock:
+            ret, frame = await asyncio.to_thread(grab_fresh_frame)
         if not ret:
             async with state_lock:
                 robot_state["error_state"] = "CAM_LOST"
@@ -266,9 +272,25 @@ async def cv_follow_loop():
 # ══════════════════════════════════════════════════════════════════════
 
 async def uart_worker():
+    global ser
     print("📡  UART telemetry worker started.")
+    last_reconnect_attempt = 0.0
+    RECONNECT_INTERVAL = 5.0   # seconds between reconnect attempts when port is down
+
     while True:
-        if ser and ser.is_open:
+        if not (ser and ser.is_open):
+            now = time.monotonic()
+            if now - last_reconnect_attempt >= RECONNECT_INTERVAL:
+                last_reconnect_attempt = now
+                try:
+                    ser = serial.Serial(port=UART_PORT, baudrate=UART_BAUD, timeout=1)
+                    print(f"📡  UART reconnected on {UART_PORT}")
+                    async with state_lock:
+                        if robot_state["error_state"] == "UART_ERR":
+                            robot_state["error_state"] = "NOT_ERROR"
+                except Exception:
+                    ser = None
+        else:
             async with state_lock:
                 packet = (
                     f"${robot_state['gemini_status']},"
@@ -283,6 +305,11 @@ async def uart_worker():
                 print(f"⚠️   UART write error: {e}")
                 async with state_lock:
                     robot_state["error_state"] = "UART_ERR"
+                try:
+                    ser.close()
+                except Exception:
+                    pass
+                ser = None
         await asyncio.sleep(1.0 / UART_HZ)
 
 
@@ -377,6 +404,8 @@ async def listen_and_transcribe() -> str:
     recognizer.dynamic_energy_threshold = False
 
     frames, has_spoken, silence_start = [], False, None
+    record_start = asyncio.get_event_loop().time()
+    MAX_RECORD_SECONDS = 20   # safety cap so a stuck-open mic can't grow frames forever
 
     async with state_lock:
         robot_state["gemini_status"] = "LISTENING"
@@ -413,6 +442,10 @@ async def listen_and_transcribe() -> str:
         if has_spoken and silence_start is not None:
             if asyncio.get_event_loop().time() - silence_start > SILENCE_LIMIT:
                 break
+
+        if asyncio.get_event_loop().time() - record_start > MAX_RECORD_SECONDS:
+            print(" (max recording length reached)", end="", flush=True)
+            break
 
         await asyncio.sleep(0.001)
 
@@ -480,10 +513,11 @@ async def conversation_loop():
         # Grab camera frame for Gemini context
         pil_image = None
         if turn_counter % CAM_SEND_EVERY == 0:
-            ret, frame = await asyncio.to_thread(grab_fresh_frame)
+            async with cam_lock:
+                ret, frame = await asyncio.to_thread(grab_fresh_frame)
             if ret:
-                small     = cv2.resize(frame, (320, 240))
-                _, buf    = cv2.imencode(".jpg", small, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                # frame is already CAM_W x CAM_H — no resize needed before encoding
+                _, buf    = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
                 pil_image = Image.open(io.BytesIO(buf.tobytes()))
             else:
                 print("⚠️   Gemini: camera frame unavailable.")
