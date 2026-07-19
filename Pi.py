@@ -57,7 +57,7 @@ AUDIO_FORMAT    = pyaudio.paInt16
 AUDIO_CHANNELS  = 1
 AUDIO_RATE      = 16000          # 16 kHz is enough for speech recognition
 AUDIO_CHUNK     = 1024
-SILENCE_LIMIT   = 1.5            # seconds of silence before utterance ends
+SILENCE_LIMIT   = 1.0            # seconds of silence before utterance ends
 THRESHOLD       = 300            # RMS gate — below this = silence
 MIC_INDEX       = 2              # INMP441 device index, check with: python -m speech_recognition
 
@@ -148,7 +148,7 @@ Example: <HAPPY, SPIN> Yo bro, nice shirt. Where'd you get that?
 gemini_config = types.GenerateContentConfig(
     system_instruction=SYSTEM_PROMPT,
     temperature=1.1,
-    max_output_tokens=1000,
+    max_output_tokens=300,   # caps worst-case stream duration; prompt already asks for 1-3 sentences
 )
 
 # YOLO
@@ -330,12 +330,14 @@ async def tts_downloader():
             sentence_q.task_done()
             break
         try:
+            t0  = time.perf_counter()
             com = edge_tts.Communicate(text=sentence, voice=TTS_VOICE, rate=TTS_RATE)
             buf = io.BytesIO()
             async for chunk in com.stream():
                 if chunk["type"] == "audio":
                     buf.write(chunk["data"])
             buf.seek(0)
+            print(f"⏱   tts_fetch={time.perf_counter() - t0:.2f}s  ({sentence[:30]!r}...)")
             await audio_q.put(buf)
         except Exception as e:
             print(f"❌  TTS download error: {e}")
@@ -510,6 +512,8 @@ async def conversation_loop():
         async with state_lock:
             robot_state["gemini_status"] = "THINKING"
 
+        t_turn_start = time.perf_counter()   # right after speech recognition returned
+
         # Grab camera frame for Gemini context
         pil_image = None
         if turn_counter % CAM_SEND_EVERY == 0:
@@ -517,8 +521,13 @@ async def conversation_loop():
                 ret, frame = await asyncio.to_thread(grab_fresh_frame)
             if ret:
                 # frame is already CAM_W x CAM_H — no resize needed before encoding
-                _, buf    = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
-                pil_image = Image.open(io.BytesIO(buf.tobytes()))
+                # JPEG encode is CPU-bound; keep it off the event loop so it doesn't
+                # add jitter to the 10 Hz UART cadence running concurrently
+                def encode(f):
+                    ok, b = cv2.imencode(".jpg", f, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                    return b.tobytes() if ok else None
+                jpg_bytes = await asyncio.to_thread(encode, frame)
+                pil_image = Image.open(io.BytesIO(jpg_bytes)) if jpg_bytes else None
             else:
                 print("⚠️   Gemini: camera frame unavailable.")
                 async with state_lock:
@@ -533,6 +542,10 @@ async def conversation_loop():
         text_buffer   = ""
         print("🤖  ", end="", flush=True)
 
+        t_request      = time.perf_counter()   # right before the network call
+        t_first_chunk  = None
+        t_first_queued = None
+
         try:
             response = await client.models.generate_content_stream(
                 model=GEMINI_MODEL,
@@ -543,6 +556,8 @@ async def conversation_loop():
             async for chunk in response:
                 if not chunk.text:
                     continue
+                if t_first_chunk is None:
+                    t_first_chunk = time.perf_counter()
                 print(chunk.text, end="", flush=True)
                 full_response += chunk.text
                 text_buffer   += chunk.text
@@ -553,6 +568,8 @@ async def conversation_loop():
                     parts = re.split(r"(?<=[.!?])\s+|\n", clean)
                     if parts[0].strip():
                         await sentence_q.put(parts[0].strip())
+                        if t_first_queued is None:
+                            t_first_queued = time.perf_counter()
                     text_buffer = " ".join(parts[1:]) if len(parts) > 1 else ""
 
         except Exception as e:
@@ -566,7 +583,20 @@ async def conversation_loop():
         leftover = re.sub(r"<[^>]+>", "", text_buffer).strip()
         if leftover:
             await sentence_q.put(leftover)
+            if t_first_queued is None:
+                t_first_queued = time.perf_counter()
         print(flush=True)
+
+        # Pipeline timing — measure on real hardware/network rather than guessing.
+        # cam: local camera grab + JPEG encode. ttfb: network+prompt time to first
+        # Gemini token. gen_total: full model generation. to_tts: speech-end to first
+        # sentence handed to the TTS pipeline (what the user actually waits through).
+        t_gen_end = time.perf_counter()
+        cam_s     = t_request - t_turn_start
+        ttfb_s    = (t_first_chunk - t_request) if t_first_chunk else float("nan")
+        gen_s     = t_gen_end - t_request
+        to_tts_s  = (t_first_queued - t_turn_start) if t_first_queued else float("nan")
+        print(f"⏱   cam={cam_s:.2f}s  ttfb={ttfb_s:.2f}s  gen_total={gen_s:.2f}s  speech_end→first_tts={to_tts_s:.2f}s")
 
         # Update conversation history (keep last 20 turns = 40 entries)
         if full_response.strip():
